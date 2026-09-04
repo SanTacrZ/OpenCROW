@@ -131,6 +131,8 @@ class BackendSettings:
     broker_event_ttl_hours: int
     allowed_ws_origins: tuple[str, ...]
     ui_shared_secret: str | None
+    rate_limit_max_attempts: int = 30
+    rate_limit_window_sec: float = 60.0
 
 
 @dataclass(frozen=True)
@@ -303,6 +305,22 @@ def load_backend_settings() -> BackendSettings:
         ui_shared_secret=str(secret)
         if (secret := _env_or_config("OPENCROW_CONSTELLATION_UI_SHARED_SECRET", config, "ui_shared_secret", ""))
         else None,
+        rate_limit_max_attempts=int(
+            _env_or_config(
+                "OPENCROW_CONSTELLATION_RATE_LIMIT_MAX_ATTEMPTS",
+                config,
+                "rate_limit_max_attempts",
+                30,
+            )
+        ),
+        rate_limit_window_sec=float(
+            _env_or_config(
+                "OPENCROW_CONSTELLATION_RATE_LIMIT_WINDOW_SEC",
+                config,
+                "rate_limit_window_sec",
+                60.0,
+            )
+        ),
     )
 
 

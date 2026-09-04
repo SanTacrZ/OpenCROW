@@ -8,6 +8,8 @@ import base64
 import json
 import secrets
 import threading
+import time
+from collections import deque
 from dataclasses import dataclass, field, replace
 from typing import Any
 from urllib.parse import quote, urlsplit
@@ -21,11 +23,49 @@ from .config import BackendSettings, load_backend_settings
 from .storage import ConstellationStorage
 
 
+class RateLimiter:
+    """Thread-safe sliding-window limiter for failed-auth backstops.
+
+    Only failures are recorded, so valid UI polling and runtime
+    heartbeats never trip it. In-memory by design: document the
+    single-backend scope, share nothing across replicas.
+    """
+
+    def __init__(self, *, max_attempts: int, window_sec: float, clock=time.monotonic) -> None:
+        self.max_attempts = max(1, int(max_attempts))
+        self.window_sec = max(1.0, float(window_sec))
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._hits: dict[str, deque[float]] = {}
+
+    def exceeded(self, key: str) -> float | None:
+        """Record one attempt; return retry-after seconds when over the limit."""
+        now = self._clock()
+        with self._lock:
+            hits = self._hits.get(key)
+            if hits is None:
+                hits = self._hits[key] = deque()
+            while hits and hits[0] <= now - self.window_sec:
+                hits.popleft()
+            if len(hits) >= self.max_attempts:
+                return max(0.0, hits[0] + self.window_sec - now)
+            hits.append(now)
+            if len(self._hits) > 4096:
+                for stale in [k for k, v in self._hits.items() if not v]:
+                    del self._hits[stale]
+            return None
+
+    def clear(self, key: str) -> None:
+        with self._lock:
+            self._hits.pop(key, None)
+
+
 @dataclass
 class AppState:
     settings: BackendSettings
     storage: ConstellationStorage
     runtime_sockets: dict[str, Any] = field(default_factory=dict)
+    rate_limiter: RateLimiter | None = None
 
     def attach_runtime(self, runtime_id: str, socket: Any) -> None:
         self.runtime_sockets[runtime_id] = socket
@@ -83,6 +123,14 @@ class BaseHandler(tornado.web.RequestHandler):
         if self.request.path == "/api/v1/health":
             return
         if not self.app_state.storage.validate_system_token(self._token()):
+            limiter = self.app_state.rate_limiter
+            if limiter is not None:
+                retry_after = limiter.exceeded(f"auth:{self.request.remote_ip}")
+                if retry_after is not None:
+                    self.set_status(429)
+                    self.set_header("Retry-After", str(int(retry_after) + 1))
+                    self.finish({"ok": False, "error": "Too many failed authentication attempts."})
+                    raise tornado.web.Finish()
             self.set_status(401)
             self.finish({"ok": False, "error": "Unauthorized"})
             raise tornado.web.Finish()
@@ -591,7 +639,18 @@ class TopicAdminExchangeHandler(BaseHandler):
         except KeyError as exc:
             raise tornado.web.HTTPError(404, reason=f"Unknown member or topic: {member_id}") from exc
         except PermissionError as exc:
+            limiter = self.app_state.rate_limiter
+            if limiter is not None:
+                retry_after = limiter.exceeded(f"exchange:{topic}")
+                if retry_after is not None:
+                    self.set_status(429)
+                    self.set_header("Retry-After", str(int(retry_after) + 1))
+                    self.finish({"ok": False, "error": "Too many failed exchange attempts."})
+                    return
             raise tornado.web.HTTPError(403, reason=str(exc)) from exc
+        limiter = self.app_state.rate_limiter
+        if limiter is not None:
+            limiter.clear(f"exchange:{topic}")
         self.write_json({"ok": True, "member": member})
 
 
@@ -1100,7 +1159,14 @@ def main() -> int:
         settings = replace(settings, listen_port=args.port)
     storage = ConstellationStorage(settings)
     storage.ensure_indexes()
-    app_state = AppState(settings=settings, storage=storage)
+    app_state = AppState(
+        settings=settings,
+        storage=storage,
+        rate_limiter=RateLimiter(
+            max_attempts=settings.rate_limit_max_attempts,
+            window_sec=settings.rate_limit_window_sec,
+        ),
+    )
     app = build_app(app_state)
     app.listen(settings.listen_port, address=settings.listen_host)
     tornado.ioloop.IOLoop.current().start()
